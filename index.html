@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Helmet Dashboard</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #f4f6f8; color: #1a1a1a; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .card { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .row { display: flex; justify-content: space-between; align-items: center; margin: 6px 0; }
+  .ok { color: #1b7f3b; font-weight: 600; } .bad { color: #c62828; font-weight: 600; }
+  input[type=text], input[type=tel] { width: 100%; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; }
+  button { padding: 12px 16px; font-size: 16px; border: 0; border-radius: 8px; cursor: pointer; }
+  .primary { background: #1f3b57; color: #fff; } .ghost { background: #e5e9ee; }
+  .switch { position: relative; width: 52px; height: 30px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: #bbb; border-radius: 30px; transition: .2s; }
+  .slider:before { content: ""; position: absolute; height: 24px; width: 24px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+  input:checked + .slider { background: #1b7f3b; } input:checked + .slider:before { transform: translateX(22px); }
+  #alert { display: none; position: fixed; inset: 0; background: #b71c1c; color: #fff; text-align: center; padding: 24px; z-index: 10; flex-direction: column; justify-content: center; }
+  #alert h2 { font-size: 28px; margin: 0 0 8px; } #count { font-size: 80px; font-weight: 700; margin: 8px 0; }
+  #alert button { margin: 8px auto; width: 100%; max-width: 320px; }
+  small { color: #666; }
+</style>
+</head>
+<body>
+
+<h1>Smart Helmet Dashboard</h1>
+
+<div class="card">
+  <div class="row"><span>Helmet link</span><span id="link" class="bad">Not connected</span></div>
+  <div class="row"><span>Alcohol</span><span id="alc">--</span></div>
+  <div class="row"><span>Ride status</span><span id="ign">--</span></div>
+  <div class="row"><span>Crash</span><span id="crash" class="ok">--</span></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <strong>Auto-dial emergency</strong>
+    <label class="switch"><input type="checkbox" id="autodial" checked><span class="slider"></span></label>
+  </div>
+  <small>ON: after a crash, a countdown starts and the call is placed automatically unless cancelled. OFF: you only get manual Call / SMS buttons.</small>
+  <p style="margin:12px 0 4px">Emergency number</p>
+  <input type="tel" id="number" value="108">
+  <small>Use your own number while testing, not a real ambulance line.</small>
+  <p style="margin:12px 0 4px">Firebase database URL</p>
+  <input type="text" id="dburl" placeholder="https://your-project-default-rtdb.firebaseio.com">
+  <small>The same URL you entered on the helmet's setup page.</small>
+</div>
+
+<div class="card">
+  <button class="ghost" onclick="triggerCrash()">Simulate crash (test)</button>
+</div>
+
+<div id="alert">
+  <h2>ACCIDENT DETECTED</h2>
+  <div id="msg">Calling emergency in</div>
+  <div id="count">10</div>
+  <div id="loc"><small style="color:#ffd7d7">Getting location...</small></div>
+  <button class="ghost" onclick="cancelAlert()">I'M OK - CANCEL</button>
+  <button class="primary" onclick="callNow()">CALL NOW</button>
+  <button class="primary" onclick="sendSMS()">SEND SMS WITH LOCATION</button>
+</div>
+
+<script>
+const COUNTDOWN_SECONDS = 10;
+let timer = null, alertActive = false, mapsLink = "";
+
+const autoToggle = document.getElementById("autodial");
+const numberInput = document.getElementById("number");
+const dbInput = document.getElementById("dburl");
+
+// ---------- Remember settings on this phone ----------
+try {
+  const a = localStorage.getItem("autodial"); if (a !== null) autoToggle.checked = (a === "1");
+  const n = localStorage.getItem("number");   if (n) numberInput.value = n;
+  const u = localStorage.getItem("dburl");    if (u) dbInput.value = u;
+} catch (e) {}
+autoToggle.addEventListener("change", () => { try { localStorage.setItem("autodial", autoToggle.checked ? "1" : "0"); } catch (e) {} });
+numberInput.addEventListener("change", () => { try { localStorage.setItem("number", numberInput.value.trim()); } catch (e) {} });
+dbInput.addEventListener("change", () => {
+  try { localStorage.setItem("dburl", dbInput.value.trim()); } catch (e) {}
+  lastCount = null; lastBeat = null;
+});
+
+// ---------- Keep the screen on so the page keeps polling ----------
+async function keepAwake() { try { if ("wakeLock" in navigator) await navigator.wakeLock.request("screen"); } catch (e) {} }
+document.addEventListener("click", keepAwake, { once: true });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") keepAwake(); });
+
+// ---------- Read helmet status from Firebase ----------
+let lastBeat = null, lastBeatChange = 0, lastCount = null;
+
+function setText(id, t, cls) { const el = document.getElementById(id); el.textContent = t; el.className = cls; }
+
+async function poll() {
+  const base = dbInput.value.trim().replace(/\/+$/, "");
+  if (!base) { setText("link", "Enter database URL", "bad"); return; }
+  try {
+    const r = await fetch(base + "/helmet.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (!d) { setText("link", "Waiting for helmet", "bad"); return; }
+
+    const now = Date.now();
+    if (d.beat !== lastBeat) { lastBeat = d.beat; lastBeatChange = now; }
+    const online = (now - lastBeatChange) < 10000;
+    setText("link", online ? "Online" : "Helmet offline", online ? "ok" : "bad");
+
+    if (online) {
+      if (d.warmup) setText("alc", "Warming up...", "ok");
+      else setText("alc", d.alcohol ? "DETECTED" : "Clear", d.alcohol ? "bad" : "ok");
+      setText("ign", d.rideAllowed ? "ALLOWED" : "BLOCKED", d.rideAllowed ? "ok" : "bad");
+      setText("crash", d.crash ? "DETECTED" : "None", d.crash ? "bad" : "ok");
+    } else {
+      setText("alc", "--", "ok"); setText("ign", "--", "ok"); setText("crash", "--", "ok");
+    }
+
+    // a new crash = crashCount went up since we last looked
+    const count = d.crashCount || 0;
+    if (lastCount === null || count < lastCount) lastCount = count;   // first read, or helmet rebooted
+    else if (count > lastCount) { lastCount = count; triggerCrash(); }
+  } catch (e) {
+    setText("link", "Cannot reach database", "bad");
+  }
+}
+setInterval(poll, 2000);
+poll();
+
+// ---------- Crash flow ----------
+function triggerCrash() {
+  if (alertActive) return;
+  alertActive = true;
+  document.getElementById("alert").style.display = "flex";
+  getLocation();
+
+  if (autoToggle.checked) {
+    let n = COUNTDOWN_SECONDS;
+    document.getElementById("msg").textContent = "Calling emergency in";
+    document.getElementById("count").textContent = n;
+    timer = setInterval(() => {
+      n--;
+      document.getElementById("count").textContent = n;
+      if (n <= 0) { clearInterval(timer); callNow(); }
+    }, 1000);
+  } else {
+    document.getElementById("msg").textContent = "Auto-dial is OFF - choose an action";
+    document.getElementById("count").textContent = "!";
+  }
+}
+
+function cancelAlert() {
+  clearInterval(timer);
+  alertActive = false;
+  document.getElementById("alert").style.display = "none";
+}
+
+function getLocation() {
+  if (!navigator.geolocation) { document.getElementById("loc").textContent = "Location not supported"; return; }
+  navigator.geolocation.getCurrentPosition(p => {
+    mapsLink = `https://maps.google.com/?q=${p.coords.latitude},${p.coords.longitude}`;
+    document.getElementById("loc").innerHTML = `<small style="color:#ffd7d7">Location: ${p.coords.latitude.toFixed(5)}, ${p.coords.longitude.toFixed(5)}</small>`;
+  }, () => {
+    document.getElementById("loc").innerHTML = `<small style="color:#ffd7d7">Location unavailable (allow location access)</small>`;
+  }, { enableHighAccuracy: true, timeout: 8000 });
+}
+
+function callNow() {
+  clearInterval(timer);
+  window.location.href = "tel:" + numberInput.value;
+}
+function sendSMS() {
+  const body = encodeURIComponent("ACCIDENT ALERT! Helmet crash detected. Location: " + (mapsLink || "unavailable"));
+  window.location.href = `sms:${numberInput.value}?body=${body}`;
+}
+</script>
+</body>
+</html>
